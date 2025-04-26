@@ -10,6 +10,8 @@
 | OS           | Device       | Backend           | Model        | Time Cost in Seconds|
 |:------------:|:------------:|:-----------------:|:------------:|:------------------------------------------------:|
 | Ubuntu-24.04 | Laptop      | CPU <br> i7-1165G7 | GTE-Large-Chinese <br> f32 | 0.11                               |
+| Ubuntu-24.04 | Laptop      | CPU <br> i7-1165G7 | GTE-Large-Chinese <br> q8f32 | 0.035                            |
+
 
 
 ## 支持的模型：

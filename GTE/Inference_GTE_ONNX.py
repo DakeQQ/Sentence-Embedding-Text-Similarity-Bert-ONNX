@@ -5,9 +5,9 @@ import onnxruntime
 
 
 onnx_model_A = r"/home/DakeQQ/Downloads/GTE_Optimized/Model_GTE.onnx"                       # The exported onnx model save path.
-vocab_path = '/home/DakeQQ/Downloads/nlp_gte_sentence-embedding_chinese-small/vocab.txt'    # Set the path where the GTE model vocab.txt stored.
-sentence_1 = "吃完海鲜可以喝牛奶吗?"                                                            # The sentence for similarity test.
-sentence_2 = "不可以，早晨喝牛奶不科学"                                                          # The sentence for similarity test.
+vocab_path = '/home/DakeQQ/Downloads/nlp_gte_sentence-embedding_chinese-large/vocab.txt'    # Set the path where the GTE model vocab.txt stored.
+sentence_1 = "吃完海鲜可以喝牛奶吗?"                                                           # The sentence for similarity test.
+sentence_2 = "不可以，早晨喝牛奶不科学"                                                         # The sentence for similarity test.
 
 ORT_Accelerate_Providers = ['CPUExecutionProvider']       # If you have accelerate devices for : ['CUDAExecutionProvider', 'TensorrtExecutionProvider', 'CoreMLExecutionProvider', 'DmlExecutionProvider', 'OpenVINOExecutionProvider', 'ROCMExecutionProvider', 'MIGraphXExecutionProvider', 'AzureExecutionProvider']
                                                           # else keep empty.

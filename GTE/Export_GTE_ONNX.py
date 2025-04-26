@@ -5,7 +5,7 @@ import numpy as np
 import onnxruntime
 from transformers import AutoModel
 
-model_path = r"/home/DakeQQ/Downloads/nlp_gte_sentence-embedding_chinese-small"    # Path to the entire downloaded GTE model project.
+model_path = r"/home/DakeQQ/Downloads/nlp_gte_sentence-embedding_chinese-large"    # Path to the entire downloaded GTE model project.
 onnx_model_A = r"/home/DakeQQ/Downloads/GTE_ONNX/Model_GTE.onnx"                   # The exported onnx model save path.
 vocab_path = f'{model_path}/vocab.txt'                                             # Set the path where the GTE model vocab.txt stored.
 sentence_1 = "吃完海鲜可以喝牛奶吗?"                                                   # The sentence for similarity test.
@@ -60,8 +60,8 @@ with torch.inference_mode():
     model = AutoModel.from_pretrained(model_path, torch_dtype=torch.float32).eval()
     input_ids = torch.zeros((1, MAX_INPUT_WORDS), dtype=torch.int32)
     input_ids[:, 0] = TOKEN_END
-    embed_model = BERT(model, MAX_INPUT_WORDS, TOKEN_END)
-    torch.onnx.export(embed_model,
+    model = BERT(model, MAX_INPUT_WORDS, TOKEN_END)
+    torch.onnx.export(model,
                       (input_ids,),
                       onnx_model_A,
                       input_names=['text_ids'],
@@ -71,7 +71,7 @@ with torch.inference_mode():
                       } if DYNAMIC_AXES else None,
                       do_constant_folding=True,
                       opset_version=17)
-del embed_model
+del model
 del input_ids
 print("\nExport Done...")
 

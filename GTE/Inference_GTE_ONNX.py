@@ -79,9 +79,10 @@ def tokenizer(input_string, max_input_words, is_dynamic):
                 if ids_len == full:
                     break
     input_ids[:, ids_len] = TOKEN_END
+    ids_len += 1
     if is_dynamic:
-        input_ids = input_ids[:, :ids_len + 1]
-    return input_ids
+        input_ids = input_ids[:, :ids_len]
+    return input_ids, np.array([ids_len], dtype=np.int64)
 
 
 print("\nRun GTE model by ONNXRuntime.")
@@ -100,6 +101,7 @@ ort_session_A = onnxruntime.InferenceSession(onnx_model_A, sess_options=session_
 print(f"\nUsable Providers: {ort_session_A.get_providers()}")
 shape_value_in = ort_session_A._inputs_meta[0].shape[-1]
 in_name_A0 = ort_session_A.get_inputs()[0].name
+in_name_A1 = ort_session_A.get_inputs()[1].name
 out_name_A0 = ort_session_A.get_outputs()[0].name
 if isinstance(shape_value_in, str):
     max_input_words = 1024                  # Default value, you can adjust it.
@@ -111,13 +113,11 @@ else:
 # Run the cosine similarity
 start_time = time.time()
 
-input_ids = tokenizer(sentence_1, max_input_words, is_dynamic)
-output_1 = ort_session_A.run([out_name_A0], {in_name_A0: input_ids})[0]
+input_ids, ids_len = tokenizer(sentence_1, max_input_words, is_dynamic)
+output_1 = ort_session_A.run([out_name_A0], {in_name_A0: input_ids, in_name_A1: ids_len})[0]
 
-input_ids = tokenizer(sentence_2, max_input_words, is_dynamic)
-output_2 = ort_session_A.run([out_name_A0], {in_name_A0: input_ids})[0]
+input_ids, ids_len = tokenizer(sentence_2, max_input_words, is_dynamic)
+output_2 = ort_session_A.run([out_name_A0], {in_name_A0: input_ids, in_name_A1: ids_len})[0]
 
 cos_similarity = np.dot(output_1, output_2) / np.sqrt(np.dot(output_1, output_1) * np.dot(output_2, output_2))
 print(f"\nThe Cosine Similarity between: \n\n1.'{sentence_1}' \n2.'{sentence_2}' \n\nScore = {cos_similarity:.3f}\n\nTime Cost: {time.time() - start_time:.3f} seconds")
-
-

@@ -16,7 +16,7 @@ from transformers import AutoModel
 # Path Setting
 original_folder_path = r"/home/DakeQQ/Downloads/GTE_ONNX"                            # The original float32 exported model folder.
 quanted_folder_path = r"/home/DakeQQ/Downloads/GTE_Optimized"                        # The optimized folder.
-download_path = r'/home/DakeQQ/Downloads/nlp_gte_sentence-embedding_chinese-small'   # Set the folder path where the LLM whole project downloaded, otherwise set "NONE".
+download_path = r'/home/DakeQQ/Downloads/nlp_gte_sentence-embedding_chinese-large'   # Set the folder path where the LLM whole project downloaded, otherwise set "NONE".
 model_path = os.path.join(original_folder_path, "Model_GTE.onnx")                    # The original fp32 model path.
 quanted_model_path = os.path.join(quanted_folder_path, "Model_GTE.onnx")             # The optimized model stored path.
 quantize_q8 = True                                                                   # Default format is uint8.

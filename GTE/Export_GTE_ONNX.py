@@ -59,7 +59,8 @@ print("\nExport Start...")
 with torch.inference_mode():
     model = AutoModel.from_pretrained(model_path, torch_dtype=torch.float32).eval()
     input_ids = torch.zeros((1, MAX_INPUT_WORDS), dtype=torch.int32)
-    input_ids[:, 0] = TOKEN_END
+    if DYNAMIC_AXES:
+        input_ids[:, 0] = TOKEN_END
     model = BERT(model, MAX_INPUT_WORDS, TOKEN_END)
     torch.onnx.export(model,
                       (input_ids,),
@@ -123,7 +124,7 @@ shape_value_in = ort_session_A._inputs_meta[0].shape[-1]
 in_name_A0 = ort_session_A.get_inputs()[0].name
 out_name_A0 = ort_session_A.get_outputs()[0].name
 if isinstance(shape_value_in, str):
-    max_input_words = 512                   # Default value, you can adjust it.
+    max_input_words = 1024                  # Default value, you can adjust it.
     is_dynamic = True
 else:
     max_input_words = shape_value_in

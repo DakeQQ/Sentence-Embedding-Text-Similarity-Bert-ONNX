@@ -102,7 +102,7 @@ shape_value_in = ort_session_A._inputs_meta[0].shape[-1]
 in_name_A0 = ort_session_A.get_inputs()[0].name
 out_name_A0 = ort_session_A.get_outputs()[0].name
 if isinstance(shape_value_in, str):
-    max_input_words = 512                   # Default value, you can adjust it.
+    max_input_words = 1024                  # Default value, you can adjust it.
     is_dynamic = True
 else:
     max_input_words = shape_value_in

@@ -16,3 +16,7 @@
 
 ## 支持的模型：
 - GTE 系列: Tiny, Small, Base, Large, [中文](https://modelscope.cn/models/iic/nlp_gte_sentence-embedding_chinese-large), [英文](https://modelscope.cn/models/iic/nlp_gte_sentence-embedding_english-large), [多语言](https://modelscope.cn/models/iic/gte_sentence-embedding_multilingual-base).
+
+
+## Download:
+- [Google Drive](https://drive.google.com/drive/folders/1osL45x17a39znxmqf4DFDOTpPY9fDXqe?usp=sharing)

@@ -74,7 +74,7 @@ with torch.inference_mode():
                       opset_version=17)
 del model
 del input_ids
-print("\nExport Done...")
+print("\nExport Done!")
 
 
 # For GTE Model

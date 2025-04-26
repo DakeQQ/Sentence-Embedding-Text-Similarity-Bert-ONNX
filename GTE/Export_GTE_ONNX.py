@@ -59,7 +59,7 @@ print("\nExport Start...")
 with torch.inference_mode():
     model = AutoModel.from_pretrained(model_path, torch_dtype=torch.float32).eval()
     input_ids = torch.zeros((1, MAX_INPUT_WORDS), dtype=torch.int32)
-    if DYNAMIC_AXES:
+    if not DYNAMIC_AXES:
         input_ids[:, 0] = TOKEN_END
     model = BERT(model, MAX_INPUT_WORDS, TOKEN_END)
     torch.onnx.export(model,

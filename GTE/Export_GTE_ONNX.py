@@ -79,15 +79,15 @@ print("\nExport Done...")
 
 # For GTE Model
 def tokenizer(input_string, max_input_words, is_dynamic):
-    input_ids = np.zeros(max_input_words, dtype=np.int32)
-    input_string = re.findall(r'[\u4e00-\u9fa5]|[a-zA-Z]+', input_string.lower())
+    input_ids = np.zeros((1, max_input_words), dtype=np.int32)
+    input_string = re.findall(r'[\u4e00-\u9fa5]|[a-zA-Z]+|[^\w\s]', input_string.lower())
     input_ids[0] = TOKEN_BEGIN
     full = max_input_words - 1
     ids_len = 1
     for i in input_string:
         indices = np.where(vocab == i)[0]
         if len(indices) > 0:
-            input_ids[ids_len] = indices[0]
+            input_ids[:, ids_len] = indices[0]
             ids_len += 1
             if ids_len == full:
                 break
@@ -95,16 +95,16 @@ def tokenizer(input_string, max_input_words, is_dynamic):
             for j in list(i):
                 indices = np.where(vocab == j)[0]
                 if len(indices) > 0:
-                    input_ids[ids_len] = indices[0]
+                    input_ids[:, ids_len] = indices[0]
                 else:
-                    input_ids[ids_len] = TOKEN_UNKNOWN
+                    input_ids[:, ids_len] = TOKEN_UNKNOWN
                 ids_len += 1
                 if ids_len == full:
                     break
-    input_ids[ids_len] = TOKEN_END
+    input_ids[:, ids_len] = TOKEN_END
     if is_dynamic:
-        input_ids = input_ids[:ids_len + 1]
-    return input_ids.reshape(1, -1)
+        input_ids = input_ids[:, :ids_len + 1]
+    return input_ids
 
 
 print("\nRun GTE model by ONNXRuntime.")

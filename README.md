@@ -3,7 +3,7 @@
  - 利用 ONNX Runtime 获取句子嵌入向量和相似度。
 
 ## Supported Models:
-- GTE Series: Tiny, Small, Base, Large, [Chinese](https://modelscope.cn/models/iic/nlp_gte_sentence-embedding_chinese-large), [English](https://modelscope.cn/models/iic/nlp_gte_sentence-embedding_english-large), [Multi-lingual](https://modelscope.cn/models/iic/gte_sentence-embedding_multilingual-base).
+- GTE Series: Tiny, Small, Base, Large, [Chinese](https://modelscope.cn/models/iic/nlp_gte_sentence-embedding_chinese-large), [English](https://modelscope.cn/models/iic/nlp_gte_sentence-embedding_english-large), [Multilingual](https://modelscope.cn/models/iic/gte_sentence-embedding_multilingual-base).
 
 
 ## 性能 Performance  

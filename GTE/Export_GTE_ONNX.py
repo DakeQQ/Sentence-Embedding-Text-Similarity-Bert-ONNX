@@ -28,12 +28,27 @@ class BERT(torch.nn.Module):
     def __init__(self, bert_model, max_seq_len):
         super(BERT, self).__init__()
         self.bert_model = bert_model
-        attention_head_size_factor = float(bert_model.encoder.layer._modules["0"].attention.self.attention_head_size ** -0.25)
+
+        num_head = bert_model.encoder.layer._modules["0"].attention.self.num_attention_heads
+        head_dim = bert_model.encoder.layer._modules["0"].attention.self.attention_head_size
+        hidden_size = bert_model.encoder.layer._modules["0"].attention.self.all_head_size
+        scale_factor = float(head_dim ** -0.25)
+
         for layer in self.bert_model.encoder.layer:
-            layer.attention.self.query.weight.data *= attention_head_size_factor
-            layer.attention.self.query.bias.data *= attention_head_size_factor
-            layer.attention.self.key.weight.data *= attention_head_size_factor
-            layer.attention.self.key.bias.data *= attention_head_size_factor
+            layer.attention.self.query.weight.data *= scale_factor
+            layer.attention.self.query.bias.data *= scale_factor
+            layer.attention.self.key.weight.data *= scale_factor
+            layer.attention.self.key.bias.data *= scale_factor
+
+            layer.attention.self.query.weight.data = layer.attention.self.query.weight.data.view(num_head, head_dim, hidden_size).transpose(1, 2).contiguous()
+            layer.attention.self.key.weight.data = layer.attention.self.key.weight.data.view(num_head, head_dim, hidden_size).transpose(1, 2).contiguous()
+            layer.attention.self.value.weight.data = layer.attention.self.value.weight.data.view(num_head, head_dim, hidden_size).transpose(1, 2).contiguous()
+            layer.attention.self.query.bias.data = layer.attention.self.query.bias.data.view(num_head, 1, head_dim).contiguous()
+            layer.attention.self.key.bias.data = layer.attention.self.key.bias.data.view(num_head, 1, head_dim).contiguous()
+            layer.attention.self.value.bias.data = layer.attention.self.value.bias.data.view(num_head, 1, head_dim).contiguous()
+            layer.attention.output.dense.weight.data = layer.attention.output.dense.weight.data.view(hidden_size, num_head, head_dim).permute(1, 2, 0).contiguous()
+            layer.attention.output.dense.bias.data = layer.attention.output.dense.bias.data.view(1, 1, -1).contiguous()
+
         self.bert_model.embeddings.token_type_embeddings.weight.data = self.bert_model.embeddings.token_type_embeddings.weight.data[[0], :max_seq_len].unsqueeze(-1)
         self.bert_model.embeddings.position_embeddings.weight.data = self.bert_model.embeddings.position_embeddings.weight.data[:max_seq_len, :].unsqueeze(0)
 
@@ -42,13 +57,15 @@ class BERT(torch.nn.Module):
             input_ids = input_ids[:, :ids_len]
         hidden_states = self.bert_model.embeddings.LayerNorm(self.bert_model.embeddings.word_embeddings(input_ids) + self.bert_model.embeddings.token_type_embeddings.weight.data[:, :ids_len] + self.bert_model.embeddings.position_embeddings.weight.data[:, :ids_len])
         for layer in self.bert_model.encoder.layer:
-            query_layer = layer.attention.self.query(hidden_states).view(-1, layer.attention.self.num_attention_heads, layer.attention.self.attention_head_size).transpose(0, 1)
-            key_layer = layer.attention.self.key(hidden_states).view(-1, layer.attention.self.num_attention_heads, layer.attention.self.attention_head_size).permute(1, 2, 0)
-            value_layer = layer.attention.self.value(hidden_states).view(-1, layer.attention.self.num_attention_heads, layer.attention.self.attention_head_size).transpose(0, 1)
-            attn_out = torch.matmul(torch.nn.functional.softmax(torch.matmul(query_layer, key_layer), dim=-1), value_layer).transpose(0, 1).contiguous().view(1, -1, layer.attention.self.all_head_size)
-            attn_out = layer.attention.output.LayerNorm(layer.attention.output.dense(attn_out) + hidden_states)
-            hidden_states = layer.output.LayerNorm(layer.output.dense(layer.intermediate.intermediate_act_fn(layer.intermediate.dense(attn_out))) + attn_out)
-        return hidden_states[:, 0].squeeze()
+            q = torch.matmul(hidden_states, layer.attention.self.query.weight) + layer.attention.self.query.bias
+            k = (torch.matmul(hidden_states, layer.attention.self.key.weight) + layer.attention.self.key.bias).transpose(1, 2).contiguous()
+            v = torch.matmul(hidden_states, layer.attention.self.value.weight) + layer.attention.self.value.bias
+            attn_out = torch.matmul(torch.nn.functional.softmax(torch.matmul(q, k), dim=-1), v)
+            attn_out = torch.matmul(attn_out, layer.attention.output.dense.weight).sum(dim=0, keepdim=True) + layer.attention.output.dense.bias
+            hidden_states += attn_out
+            hidden_states = layer.attention.output.LayerNorm(hidden_states)
+            hidden_states = layer.output.LayerNorm(layer.output.dense(layer.intermediate.intermediate_act_fn(layer.intermediate.dense(hidden_states))) + hidden_states)
+        return hidden_states[0, 0]
 
 
 print("\nExport Start...")

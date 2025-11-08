@@ -32,13 +32,11 @@ class BERT(torch.nn.Module):
         num_head = bert_model.encoder.layer._modules["0"].attention.self.num_attention_heads
         head_dim = bert_model.encoder.layer._modules["0"].attention.self.attention_head_size
         hidden_size = bert_model.encoder.layer._modules["0"].attention.self.all_head_size
-        scale_factor = float(head_dim ** -0.25)
+        scale_factor = float(head_dim ** -0.5)
 
         for layer in self.bert_model.encoder.layer:
             layer.attention.self.query.weight.data *= scale_factor
             layer.attention.self.query.bias.data *= scale_factor
-            layer.attention.self.key.weight.data *= scale_factor
-            layer.attention.self.key.bias.data *= scale_factor
 
             layer.attention.self.query.weight.data = layer.attention.self.query.weight.data.view(num_head, head_dim, hidden_size).transpose(1, 2).contiguous()
             layer.attention.self.key.weight.data = layer.attention.self.key.weight.data.view(num_head, head_dim, hidden_size).transpose(1, 2).contiguous()
@@ -155,3 +153,4 @@ output_2 = ort_session_A.run([out_name_A0], {in_name_A0: input_ids, in_name_A1: 
 
 cos_similarity = np.dot(output_1, output_2) / np.sqrt(np.dot(output_1, output_1) * np.dot(output_2, output_2))
 print(f"\nThe Cosine Similarity between: \n\n1.'{sentence_1}' \n2.'{sentence_2}' \n\nScore = {cos_similarity:.3f}\n\nTime Cost: {time.time() - start_time:.3f} Seconds")
+

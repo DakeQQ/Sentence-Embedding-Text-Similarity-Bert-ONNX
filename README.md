@@ -15,4 +15,8 @@
 | Ubuntu-24.04 | Laptop      | CPU <br> i7-1165G7 | Jina-Embedding-v5-Text-small <br> q8f32 | 0.4                   |
 
 
+---
 
+### To-Do List  
+- [ ] [Jina-v3-reranker](https://huggingface.co/jinaai/jina-reranker-v3)
+- [ ] [Jina-v5-omni](https://huggingface.co/jinaai/jina-embeddings-v5-omni-small)

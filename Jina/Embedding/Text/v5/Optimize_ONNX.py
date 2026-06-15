@@ -34,7 +34,7 @@ upgrade_opset    = 0                     # Optional opset upgrade. Set 0 to disa
 # ==============================================================================
 MODEL_DTYPE = {
     "Embedding_Embed_LoRA": "int4",      # [int4, float32, float16]
-    "Embedding_Main":       "int8",      # [int8, float32, float16]
+    "Embedding_Main":       "int4",      # [int4, int8, float32, float16]
 }
 
 
@@ -59,7 +59,7 @@ fp16_op_block_list = [
 # ==============================================================================
 algorithm        = "k_quant"             # ["DEFAULT", "RTN", "HQQ", "k_quant"]
 bits             = 4                     # [4, 8]; 8 is not recommended.
-block_size       = 32                    # [16, 32, 64, 128, 256]; smaller => more accuracy.
+block_size       = 16                    # [16, 32, 64, 128, 256]; smaller => more accuracy.
 accuracy_level   = 4                     # 0:default, 1:fp32, 2:fp16, 3:bf16, 4:int8
 quant_symmetric  = False                 # False may yield more accuracy.
 nodes_to_exclude = None                  # Example: ["/layers.0/mlp/down_proj/MatMul"]
@@ -103,6 +103,7 @@ def process_single_model(
     model_path,
     quanted_model_path,
     model_name,
+    algorithm,
     bits,
     block_size,
     quant_int4_flag,
@@ -122,10 +123,21 @@ def process_single_model(
             op_types = ["Gather"]
             quant_axes = [1]
             algo = "DEFAULT"
+            blk_size = 16
+            bit = 4
         else:
             op_types = ["MatMul"]
             quant_axes = [0]
-            algo = algorithm_copy
+            if quant_int8_flag:
+                algo = "DEFAULT"
+                bit = 8
+            else:
+                algo = algorithm
+                bit = bits
+            blk_size = block_size
+
+
+
 
         model = quant_utils.load_model_with_shape_infer(Path(model_path))
         axes_tuple = tuple((op_types[i], quant_axes[i]) for i in range(len(op_types)))
@@ -137,8 +149,8 @@ def process_single_model(
             )
         elif algo == "HQQ":
             quant_config = matmul_nbits_quantizer.HQQWeightOnlyQuantConfig(
-                bits=bits,
-                block_size=block_size,
+                bits=bit,
+                block_size=blk_size,
                 axis=quant_axes[0],
                 quant_format=quant_utils.QuantFormat.QOperator,
                 op_types_to_quantize=tuple(op_types),
@@ -151,7 +163,7 @@ def process_single_model(
             )
         else:
             quant_config = matmul_nbits_quantizer.DefaultWeightOnlyQuantConfig(
-                block_size=block_size,
+                block_size=blk_size,
                 is_symmetric=quant_symmetric,
                 accuracy_level=accuracy_level,
                 quant_format=quant_utils.QuantFormat.QOperator,
@@ -159,10 +171,10 @@ def process_single_model(
                 quant_axes=axes_tuple,
             )
 
-        quant_config.bits = bits
+        quant_config.bits = bit
         quant = matmul_nbits_quantizer.MatMulNBitsQuantizer(
             model,
-            block_size=block_size,
+            block_size=blk_size,
             is_symmetric=quant_symmetric,
             accuracy_level=accuracy_level,
             quant_format=quant_utils.QuantFormat.QOperator,
@@ -275,7 +287,6 @@ def process_single_model(
 # ==============================================================================
 # Main Processing Loop
 # ==============================================================================
-algorithm_copy = algorithm
 
 for model_name, target_dtype in MODEL_DTYPE.items():
     print(f"\n--- Processing model: {model_name} ---")
@@ -296,7 +307,7 @@ for model_name, target_dtype in MODEL_DTYPE.items():
         continue
 
     process_single_model(
-        model_path, quanted_model_path, model_name,
+        model_path, quanted_model_path, model_name, algorithm,
         bits, block_size, quant_int4, quant_int8,
         quant_float16, keep_io_dtype, fp16_op_block_list,
     )

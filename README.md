@@ -6,7 +6,7 @@
 ## 支持的模型 Supported Models:
 - [GTE-Tiny / Small / Base / Large + Chinese / English](https://modelscope.cn/models/iic/nlp_gte_sentence-embedding_chinese-large)
 - [Jina-Embedding-v5-Text-small / nano](https://huggingface.co/jinaai/jina-embeddings-v5-text-small)
-- [Jina-v3-reranker](https://huggingface.co/jinaai/jina-reranker-v3)
+- [Jina-Reranker-v3](https://huggingface.co/jinaai/jina-reranker-v3)
 
 
 ## 性能 Performance  
@@ -22,4 +22,4 @@
 ---
 
 ## To-Do List  
-- [ ] [Jina-v5-omni](https://huggingface.co/jinaai/jina-embeddings-v5-omni-small)
+- [ ] [Jina-Embedding-Omni-v5](https://huggingface.co/jinaai/jina-embeddings-v5-omni-small)

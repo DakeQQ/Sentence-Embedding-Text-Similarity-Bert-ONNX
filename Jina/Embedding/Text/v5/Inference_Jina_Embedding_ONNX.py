@@ -27,8 +27,8 @@ from transformers import AutoConfig, AutoTokenizer
 # PATHS
 # ══════════════════════════════════════════════════════════════════════════════
 
-MODEL_PATH              = r"/home/DakeQQ/Downloads/jina-embeddings-v5-text-small"                       # Path to the pretrained Jina v5 model directory
-ONNX_OUTPUT_DIR         = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Jina_Optimized")    # Directory containing exported ONNX files
+MODEL_PATH              = r"/home/iamj/Downloads/jina-embeddings-v5-text-small"                       # Path to the pretrained Jina v5 model directory
+ONNX_OUTPUT_DIR         = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Jina_ONNX_Omni_Optimized")    # Directory containing exported ONNX files
 onnx_model_EmbedLoRA    = os.path.join(ONNX_OUTPUT_DIR, 'Embedding_Embed_LoRA.onnx')
 onnx_model_Main         = os.path.join(ONNX_OUTPUT_DIR, 'Embedding_Main.onnx')
 
@@ -223,34 +223,6 @@ packed_settings = {
     '_disabled_optimizers': disabled_optimizers,
 }
 
-# Separate session options for EmbedLoRA models to prevent constant-folding
-# memory explosion. The dequantization ops (rotary, hadamard, shuffle, Q4 unpack) have
-# all-constant inputs, so ORT tries to evaluate them at session creation time,
-# materializing dozens of full-size intermediate float32 tensors simultaneously (60GB+).
-# NOTE: ORT_ENABLE_BASIC *still* includes constant folding. We must use ORT_DISABLE_ALL
-# and explicitly list ConstantFolding in disabled_optimizers to fully prevent it.
-session_opts_lora = onnxruntime.SessionOptions()
-session_opts_lora.log_severity_level        = 0 if ORT_LOG else 4
-session_opts_lora.log_verbosity_level       = 4
-session_opts_lora.inter_op_num_threads      = MAX_THREADS
-session_opts_lora.intra_op_num_threads      = MAX_THREADS
-session_opts_lora.execution_mode            = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
-session_opts_lora.graph_optimization_level  = onnxruntime.GraphOptimizationLevel.ORT_DISABLE_ALL
-for k, v in _session_configs.items():
-    session_opts_lora.add_session_config_entry(k, v)
-
-# Explicitly disable ConstantFolding (belt-and-suspenders with ORT_DISABLE_ALL)
-disabled_optimizers_lora = ['ConstantFolding', 'ConstantSharing']
-if disabled_optimizers:
-    disabled_optimizers_lora += disabled_optimizers
-
-packed_settings_lora = {
-    '_session_opts':        session_opts_lora,
-    '_providers':           ORT_Accelerate_Providers if ORT_Accelerate_Providers else ['CPUExecutionProvider'],
-    '_provider_options':    provider_options,
-    '_disabled_optimizers': disabled_optimizers_lora,
-}
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LOAD MODEL CONFIG
@@ -269,8 +241,7 @@ hidden_size = model_config.hidden_size
 print('Loading ONNX models ... this may take a moment.')
 
 # --- Embed + LoRA ---
-# Use packed_settings_lora to avoid constant folding the dequant ops
-ort_session_EmbedLoRA = create_session(onnx_model_EmbedLoRA, **packed_settings_lora)
+ort_session_EmbedLoRA = create_session(onnx_model_EmbedLoRA, **packed_settings)
 in_name_EmbedLoRA     = get_in_names(ort_session_EmbedLoRA)
 out_name_EmbedLoRA    = get_out_names(ort_session_EmbedLoRA)
 
@@ -332,7 +303,7 @@ def encode(input_ids, task_name, return_last_hidden_state=False):
 
     # ── Output buffers ───────────────────────────────────────────────────
     embeddings_buf = get_cached_buffer('embeddings', (batch_size, hidden_size), np.float32)
-    last_hidden_state_buf = get_cached_buffer('last_hidden_state', (batch_size, seq_len, hidden_size), np.float32)
+    last_hidden_state_buf = get_cached_buffer('last_hidden_state', (batch_size, hidden_size), np.float32)
 
     # ── Step 1: Embed + LoRA (IOBinding, outputs stay as OrtValues) ──────
     input_ids_ort = create_ort_with_numpy(input_ids.astype(np.int32), device_type, DEVICE_ID)

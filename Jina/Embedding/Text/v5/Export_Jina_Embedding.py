@@ -10,9 +10,8 @@ Architecture (FUSE_LORA_INTO_EMBED = False):
     N task LoRA ONNX files   — one per task, each outputs the 8 LoRA tensors
     1 shared Main ONNX       — backbone with LoRA as *inputs*
 
-LoRA tensors can optionally be quantized (Q4, Q8, F16, F32) to reduce
-ONNX model size. Quantization settings mirror the KV cache quantization
-style from the Qwen export scripts.
+LoRA tensors and token embeddings are stored in F16 or F32 to control
+ONNX model size.
 
 Embed_LoRA ONNX outputs (fused mode):
     hidden_states [batch, seq_len, hidden_size]
@@ -52,21 +51,11 @@ OPSET                   = 18                # ONNX opset version for export
 # LoRA architecture config
 FUSE_LORA_INTO_EMBED    = True              # True: 1 fused Embed+LoRA ONNX (all tasks); False: 1 Embed + N separate task LoRA ONNXs
 
-# Quantization config — separate dtype for embed vs LoRA, shared algorithm params
-# Fused mode:  EMBED_QUANT_DTYPE → embed_tokens.weight;  LORA_QUANT_DTYPE → LoRA tensors (both inside one ONNX)
-# Split mode:  EMBED_QUANT_DTYPE → Embed ONNX;           LORA_QUANT_DTYPE → per-task LoRA ONNXs
-EMBED_QUANT_DTYPE       = "F16"             # "ROTARY_Q4" | "ROTARY_Q4_CUDA" | "Q8" | "Q8_CUDA" | "ROTARY_Q8" | "ROTARY_Q8_CUDA" | "F16" | "F32"
-LORA_QUANT_DTYPE        = "F16"             # "ROTARY_Q4" | "ROTARY_Q4_CUDA" | "Q8" | "Q8_CUDA" | "ROTARY_Q8" | "ROTARY_Q8_CUDA" | "F16" | "F32"
-
-# Shared quantization algorithm parameters (apply to both EMBED and LORA when quantized)
-LORA_QUANT_GROUP_SIZE   = 16                # Group size for Q4 and Q8 (when USE_HADAMARD or USE_SHUFFLE enabled) per-group quantization. Smaller = more accurate. Must divide last_dim evenly.
-LORA_USE_HADAMARD       = True              # True = More Accuracy. Apply enhanced randomized Walsh-Hadamard mixing within each group before quantization. Works for Q4 and Q8 modes.
-LORA_HADAMARD_SEED      = 9527              # Seed for the deterministic Rademacher sign pattern used by the enhanced Hadamard transform.
-LORA_USE_CLIP           = True              # Clip outliers to mean ± LORA_CLIP_SIGMA*std before quantization. Works for Q4 and Q8 modes.
-LORA_CLIP_SIGMA         = 3.0               # Clip threshold in standard deviations. Lower = more aggressive clipping. 2.5-3.5 recommended.
-LORA_USE_SHUFFLE        = True              # True = More Accuracy. Interleave channels across groups so that high-variance channels are evenly distributed. Works for Q4 and Q8 modes.
-LORA_USE_SYM            = False             # True = Less storage. True: symmetric quantization (no bias, absmax-based); False: asymmetric (min-max with bias). Works for Q4 and Q8 modes.
-LORA_USE_FLOAT16_SCALE  = True              # Whether to use float16 for scale and bias in all quantized modes (Q4, Q8, and ROTARY variants).
+# Storage dtype — separate precision for embed vs LoRA tensors
+# Fused mode:  EMBED_DTYPE → embed_tokens.weight;  LORA_DTYPE → LoRA tensors (both inside one ONNX)
+# Split mode:  EMBED_DTYPE → Embed ONNX;           LORA_DTYPE → per-task LoRA ONNXs
+EMBED_DTYPE             = "F16"             # "F16" | "F32"
+LORA_DTYPE              = "F16"             # "F16" | "F32"
 
 # Runtime config
 ORT_LOG                 = False             # Enable verbose ONNX Runtime logging
@@ -154,11 +143,8 @@ LORA_INPUT_NAMES = [
     "lora_down_b",
 ]
 
-# Supported LoRA quantization dtypes
-SUPPORTED_LORA_QUANT_DTYPES = (
-    "ROTARY_Q4", "ROTARY_Q4_CUDA", "Q8", "Q8_CUDA",
-    "ROTARY_Q8", "ROTARY_Q8_CUDA", "F16", "F32"
-)
+# Supported storage dtypes
+SUPPORTED_DTYPES = ("F16", "F32")
 
 
 def get_lora_onnx_path(task_name):
@@ -358,487 +344,14 @@ def tokenize_texts(tokenizer, texts, task_name, prompt_name, sentence_transforme
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LORA QUANTIZER (mirrors KVQuantizer from Qwen_Export.py)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _next_power_of_two(n):
-    value = 1
-    while value < n:
-        value *= 2
-    return value
-
-
-def normalize_lora_quant_settings(last_dim):
-    """Validate and normalize LoRA quant settings once a representative last_dim is known."""
-    global LORA_QUANT_GROUP_SIZE
-
-    if LORA_QUANT_DTYPE not in SUPPORTED_LORA_QUANT_DTYPES:
-        raise ValueError(f"Unsupported LORA_QUANT_DTYPE: {LORA_QUANT_DTYPE}")
-
-    quantized = {"Q8", "Q8_CUDA", "ROTARY_Q8", "ROTARY_Q8_CUDA", "ROTARY_Q4", "ROTARY_Q4_CUDA"}
-    rotary = {"ROTARY_Q4", "ROTARY_Q4_CUDA", "ROTARY_Q8", "ROTARY_Q8_CUDA"}
-    notes = []
-
-    if LORA_QUANT_DTYPE in rotary and last_dim % 2 != 0:
-        raise ValueError(f"{LORA_QUANT_DTYPE} requires an even last_dim, got {last_dim}.")
-    if LORA_QUANT_DTYPE in {"Q8_CUDA", "ROTARY_Q8_CUDA"} and last_dim % 4 != 0:
-        raise ValueError(f"{LORA_QUANT_DTYPE} requires last_dim divisible by 4, got {last_dim}.")
-    if LORA_QUANT_DTYPE == "ROTARY_Q4_CUDA" and last_dim % 8 != 0:
-        raise ValueError(f"{LORA_QUANT_DTYPE} requires last_dim divisible by 8, got {last_dim}.")
-
-    if LORA_QUANT_DTYPE in quantized:
-        if LORA_QUANT_GROUP_SIZE <= 0:
-            raise ValueError(f"LORA_QUANT_GROUP_SIZE must be positive, got {LORA_QUANT_GROUP_SIZE}.")
-        if LORA_QUANT_GROUP_SIZE > last_dim:
-            notes.append(f"[Warning] LORA_QUANT_GROUP_SIZE ({LORA_QUANT_GROUP_SIZE}) > last_dim ({last_dim}); clamping.")
-            LORA_QUANT_GROUP_SIZE = last_dim
-        elif LORA_QUANT_GROUP_SIZE < last_dim and last_dim % LORA_QUANT_GROUP_SIZE != 0:
-            original = LORA_QUANT_GROUP_SIZE
-            LORA_QUANT_GROUP_SIZE = max(g for g in range(1, LORA_QUANT_GROUP_SIZE + 1) if last_dim % g == 0)
-            notes.append(f"[Warning] LORA_QUANT_GROUP_SIZE ({original}) doesn't divide last_dim ({last_dim}); using {LORA_QUANT_GROUP_SIZE}.")
-    elif any((LORA_USE_HADAMARD, LORA_USE_CLIP, LORA_USE_SHUFFLE, LORA_USE_SYM, LORA_USE_FLOAT16_SCALE)):
-        notes.append("[Info] Quant-only flags are ignored when LORA_QUANT_DTYPE is F16 or F32.")
-
-    return notes
-
-
-class LoRAQuantizer:
-    """Unified LoRA weight quantizer mirroring KVQuantizer from Qwen_Export.py.
-
-    Supports all KV cache quantization modes applied to LoRA weight tensors:
-    - ROTARY_Q4 / ROTARY_Q4_CUDA: rotary + 4-bit quantization
-    - Q8 / Q8_CUDA: 8-bit quantization
-    - ROTARY_Q8 / ROTARY_Q8_CUDA: rotary + 8-bit quantization
-
-    Precision-enhancement techniques:
-    1. Rotary transform (ROTARY_* modes): orthogonal pairwise rotation spreading outlier energy
-    2. Enhanced Hadamard transform (LORA_USE_HADAMARD): Walsh-Hadamard within groups
-    3. Channel shuffle (LORA_USE_SHUFFLE): interleave channels across groups
-    4. Residual bias correction (asymmetric modes): reduces systematic dequant drift
-    5. Sigma clipping (LORA_USE_CLIP): clip outliers before quantization
-    """
-
-    def __init__(self, last_dim, group_size, is_q4=False, is_rotary=False, is_cuda=False,
-                 use_sym=False, use_hadamard=False, use_clip=False, clip_sigma=3.0, use_shuffle=False):
-        self.last_dim = last_dim
-        self.last_dim_half = last_dim // 2
-        self.is_q4 = is_q4
-        self.is_rotary = is_rotary
-        self.is_cuda = is_cuda
-        self.use_sym = use_sym
-        self.use_hadamard = use_hadamard
-        self.use_clip = use_clip
-        self.clip_sigma = clip_sigma
-        self.use_shuffle = use_shuffle
-        self.use_residual_bias_correction = not use_sym
-
-        # Quantization range
-        if use_sym:
-            self.SIGNED_QMIN = -8 if is_q4 else -128
-            self.SIGNED_QMAX = 7 if is_q4 else 127
-            self.QMAX = float(self.SIGNED_QMAX)
-        else:
-            self.SIGNED_QMIN = None
-            self.SIGNED_QMAX = None
-            self.QMAX = 15.0 if is_q4 else 255.0
-        self.inv_qmax = 1.0 / self.QMAX
-
-        # Group parameters
-        self.is_grouped = is_q4 or ((use_hadamard or use_shuffle) and group_size < last_dim)
-        if not self.is_grouped and not is_q4:
-            self.use_hadamard = False
-            self.use_shuffle = False
-        self.group_size = group_size if self.is_grouped else last_dim
-        self.num_groups = last_dim // self.group_size if self.is_grouped else 1
-
-        # Rotary transform buffers
-        if is_rotary:
-            sqrt2 = 2.0 ** 0.5
-            inv_sqrt2 = 1.0 / sqrt2
-            self.rot_cos = inv_sqrt2
-            fwd_sin = torch.cat([torch.full((last_dim // 2,), -inv_sqrt2), torch.full((last_dim // 2,), inv_sqrt2)])
-            self.rot_sin = fwd_sin
-
-        # Hadamard transform buffers
-        if self.use_hadamard:
-            self.hadamard_size = _next_power_of_two(self.group_size)
-            self.hadamard_pad = self.hadamard_size - self.group_size
-            self.hadamard_inv_sqrt = self.hadamard_size ** -0.5
-            sign_gen = torch.Generator()
-            sign_gen.manual_seed(LORA_HADAMARD_SEED)
-            hadamard_sign = torch.randint(0, 2, (self.group_size,), generator=sign_gen, dtype=torch.int64)
-            self.hadamard_sign = hadamard_sign.float().mul_(2.0).sub_(1.0)
-            self._hadamard_levels = []
-            w = self.hadamard_size
-            while w > 1:
-                h = w // 2
-                self._hadamard_levels.append((w, h))
-                w = h
-
-        # Shuffle permutation buffers
-        if self.use_shuffle:
-            perm = torch.arange(last_dim).view(self.num_groups, self.group_size).T.contiguous().view(-1)
-            inv_perm = torch.empty_like(perm)
-            inv_perm[perm] = torch.arange(last_dim)
-            self.shuffle_idx = perm
-            self.unshuffle_idx = inv_perm
-
-    # ── Hadamard transform ───────────────────────────────────────────────
-    def _apply_hadamard(self, x, inverse=False):
-        if not self.use_hadamard:
-            return x
-        if not inverse:
-            x = x * self.hadamard_sign
-        if self.hadamard_pad:
-            x = F.pad(x, (0, self.hadamard_pad))
-        for width, half in self._hadamard_levels:
-            x = x.view(*x.shape[:-1], -1, width)
-            even, odd = torch.split(x, [half, half], dim=-1)
-            x = torch.cat([even + odd, even - odd], dim=-1)
-            x = x.view(*x.shape[:-2], -1)
-        x = x * self.hadamard_inv_sqrt
-        if self.hadamard_pad:
-            x = x[..., :self.group_size]
-        if inverse:
-            x = x * self.hadamard_sign
-        return x
-
-    # ── Rotary transform ─────────────────────────────────────────────────
-    def _rotate_forward(self, x):
-        """Apply π/4 rotation to spread outlier energy across dimension pairs."""
-        x1 = x[..., :self.last_dim_half]
-        x2 = x[..., self.last_dim_half:]
-        rot_x = torch.cat([
-            x1 * self.rot_cos + x2 * (-1.0 / (2.0 ** 0.5)),
-            x1 * (1.0 / (2.0 ** 0.5)) + x2 * self.rot_cos
-        ], dim=-1)
-        return rot_x
-
-    def _rotate_inverse(self, x):
-        """Inverse π/4 rotation."""
-        x1 = x[..., :self.last_dim_half]
-        x2 = x[..., self.last_dim_half:]
-        rot_x = torch.cat([
-            x1 * self.rot_cos + x2 * (1.0 / (2.0 ** 0.5)),
-            x1 * (-1.0 / (2.0 ** 0.5)) + x2 * self.rot_cos
-        ], dim=-1)
-        return rot_x
-
-    # ── Clipping ─────────────────────────────────────────────────────────
-    def _clip_to_sigma(self, x):
-        mean = x.mean(dim=-1, keepdim=True)
-        var = (x - mean).square().mean(dim=-1, keepdim=True)
-        std = var.sqrt()
-        bound = self.clip_sigma * std
-        return x.clamp(mean - bound, mean + bound)
-
-    # ── Quantization ─────────────────────────────────────────────────────
-    def quantize(self, tensor):
-        """Quantize a float32 tensor along the last dimension.
-
-        Returns dict with keys: 'data', 'scale', optionally 'bias'.
-        """
-        x = tensor.float()
-
-        # 1. Rotary transform
-        if self.is_rotary:
-            x = self._rotate_forward(x)
-
-        # 2. Shuffle
-        if self.use_shuffle:
-            x = x.index_select(-1, self.shuffle_idx)
-
-        # 3. Hadamard within groups
-        if self.use_hadamard:
-            orig_shape = x.shape
-            x = x.view(*orig_shape[:-1], self.num_groups, self.group_size)
-            x = self._apply_hadamard(x)
-            x = x.view(*orig_shape)
-
-        # 4. Group reshape for quantization
-        orig_shape = x.shape
-        x_grouped = x.view(*orig_shape[:-1], self.num_groups, self.group_size)
-
-        # 5. Clip
-        if self.use_clip:
-            x_grouped = self._clip_to_sigma(x_grouped)
-
-        # 6. Quantize
-        if self.use_sym:
-            absmax = x_grouped.abs().amax(dim=-1, keepdim=True)
-            scale = absmax / self.QMAX
-            scale = scale.clamp(min=1e-10)
-            x_quant = torch.round(x_grouped / scale).clamp(self.SIGNED_QMIN, self.SIGNED_QMAX).to(torch.int32)
-            if self.is_q4:
-                x_stored = torch.remainder(x_quant, 16).to(torch.uint8)
-            elif self.is_cuda:
-                x_stored = torch.remainder(x_quant, 256).to(torch.uint8)
-            else:
-                x_stored = x_quant.to(torch.int8)
-            scale = scale.squeeze(-1)
-            if LORA_USE_FLOAT16_SCALE:
-                scale = scale.half()
-            result = {'data': x_stored, 'scale': scale}
-        else:
-            block_min, block_max = torch.aminmax(x_grouped, dim=-1, keepdim=True)
-            scale = (block_max - block_min) / self.QMAX
-            scale = scale.clamp(min=1e-10)
-            x_normalized = (x_grouped - block_min) / scale
-            x_packed = torch.round(x_normalized)
-            # Residual bias correction
-            if self.use_residual_bias_correction:
-                block_residual = x_grouped - (x_packed * scale + block_min)
-                block_min = block_min + block_residual.mean(dim=-1, keepdim=True)
-            if self.is_q4:
-                x_stored = x_packed.to(torch.uint8)
-            elif self.is_cuda:
-                x_stored = x_packed.to(torch.uint8)
-            else:
-                x_stored = x_packed.to(torch.uint8)
-            scale = scale.squeeze(-1)
-            block_min = block_min.squeeze(-1)
-            if LORA_USE_FLOAT16_SCALE:
-                scale = scale.half()
-                block_min = block_min.half()
-            result = {'data': x_stored, 'scale': scale, 'bias': block_min}
-
-        # 7. Q4 packing (2 nibbles -> 1 byte)
-        if self.is_q4:
-            data = result['data']
-            data = data.view(*orig_shape[:-1], self.num_groups, self.group_size // 2, 2)
-            low, high = data.unbind(-1)
-            result['data'] = (low + high * 16).to(torch.uint8)
-
-        # 8. CUDA packing (4 uint8 -> 1 int32)
-        if self.is_cuda:
-            data = result['data']
-            packed_dim = self.group_size // 4 if not self.is_q4 else (self.group_size // 2) // 4
-            data = data.view(*orig_shape[:-1], self.num_groups, packed_dim, 4)
-            x0, x1, x2, x3 = data.unbind(-1)
-            x0, x1, x2, x3 = x0.to(torch.int32), x1.to(torch.int32), x2.to(torch.int32), x3.to(torch.int32)
-            result['data'] = (x0 + x1 * 256 + x2 * 65536 + (x3 - 128) * 16777216).to(torch.int32)
-
-        return result
-
-    # ── Dequantization ───────────────────────────────────────────────────
-    def dequantize(self, quant_result):
-        """Dequantize back to float32 tensor with original shape."""
-        data = quant_result['data']
-        scale = quant_result['scale']
-        bias = quant_result.get('bias', None)
-
-        if LORA_USE_FLOAT16_SCALE:
-            scale = scale.float()
-            if bias is not None:
-                bias = bias.float()
-
-        # 1. CUDA unpack (int32 -> 4 uint8)
-        if self.is_cuda:
-            x_i32 = data
-            r3 = x_i32 % 16777216
-            x3 = (x_i32 - r3) // 16777216 + 128
-            x2 = r3 // 65536
-            r2 = r3 % 65536
-            x1 = r2 // 256
-            x0 = r2 % 256
-            data = torch.stack([x0, x1, x2, x3], dim=-1)
-            if self.is_q4:
-                packed_dim = (self.group_size // 2) // 4
-                data = data.reshape(*data.shape[:-2], self.num_groups, self.group_size // 2)
-            else:
-                data = data.reshape(*data.shape[:-2], self.num_groups, self.group_size)
-
-        # 2. Q4 unpack (1 byte -> 2 nibbles)
-        if self.is_q4 and not self.is_cuda:
-            # data shape: [..., num_groups, group_size//2]
-            low = data % 16
-            high = data // 16
-            data = torch.stack([low, high], dim=-1).reshape(*data.shape[:-1], self.group_size)
-
-        if self.is_q4 and self.is_cuda:
-            low = data % 16
-            high = data // 16
-            data = torch.stack([low, high], dim=-1).reshape(*data.shape[:-1], self.group_size)
-
-        # 3. Dequantize values
-        if self.use_sym:
-            if self.is_q4:
-                # Decode signed Q4: stored as uint8 mod 16, recover [-8, 7]
-                x_float = (torch.remainder(data.to(torch.int16) + 8, 16) - 8).float()
-            elif self.is_cuda:
-                # Decode signed Q8 from uint8: stored mod 256, recover [-128, 127]
-                x_float = (torch.remainder(data.to(torch.int16) + 128, 256) - 128).float()
-            else:
-                # int8 directly
-                x_float = data.float()
-            x = x_float * scale.unsqueeze(-1)
-        else:
-            x_float = data.float()
-            x = x_float * scale.unsqueeze(-1) + bias.unsqueeze(-1)
-
-        # 4. Reshape back from groups
-        orig_last_dim = self.num_groups * self.group_size
-        x = x.reshape(*x.shape[:-2], orig_last_dim)
-
-        # 5. Inverse Hadamard
-        if self.use_hadamard:
-            x = x.view(*x.shape[:-1], self.num_groups, self.group_size)
-            x = self._apply_hadamard(x, inverse=True)
-            x = x.view(*x.shape[:-2], orig_last_dim)
-
-        # 6. Inverse shuffle
-        if self.use_shuffle:
-            x = x.index_select(-1, self.unshuffle_idx)
-
-        # 7. Inverse rotary
-        if self.is_rotary:
-            x = self._rotate_inverse(x)
-
-        return x
-
-
-def quantize_lora_tensors(task_lora_dict):
-    """Quantize all 8 LoRA tensor stacks according to LORA_QUANT_DTYPE settings.
-
-    Uses the full KV cache quantization algorithm from Qwen_Export.py:
-    rotary, hadamard, shuffle, clip, residual bias correction, Q4/Q8/CUDA packing.
-
-    Args:
-        task_lora_dict: dict of {name: np.ndarray} with 8 stacked LoRA tensors
-
-    Returns:
-        If F32/F16: same dict (possibly cast to float16)
-        If quantized: dict with keys name + '_data', name + '_scale', [name + '_bias']
-    """
-    if LORA_QUANT_DTYPE not in SUPPORTED_LORA_QUANT_DTYPES:
-        raise ValueError(f"Unsupported LORA_QUANT_DTYPE: {LORA_QUANT_DTYPE}")
-
-    if LORA_QUANT_DTYPE == "F32":
-        return task_lora_dict
-
-    if LORA_QUANT_DTYPE == "F16":
-        return {k: v.astype(np.float16) for k, v in task_lora_dict.items()}
-
-    is_q4 = LORA_QUANT_DTYPE in ("ROTARY_Q4", "ROTARY_Q4_CUDA")
-    is_rotary = LORA_QUANT_DTYPE in ("ROTARY_Q4", "ROTARY_Q4_CUDA", "ROTARY_Q8", "ROTARY_Q8_CUDA")
-    is_cuda = LORA_QUANT_DTYPE in ("Q8_CUDA", "ROTARY_Q8_CUDA", "ROTARY_Q4_CUDA")
-
-    result = {}
-    for name, arr in task_lora_dict.items():
-        tensor = torch.from_numpy(arr).float()
-        last_dim = tensor.shape[-1]
-
-        quantizer = LoRAQuantizer(
-            last_dim=last_dim,
-            group_size=LORA_QUANT_GROUP_SIZE,
-            is_q4=is_q4,
-            is_rotary=is_rotary,
-            is_cuda=is_cuda,
-            use_sym=LORA_USE_SYM,
-            use_hadamard=LORA_USE_HADAMARD,
-            use_clip=LORA_USE_CLIP,
-            clip_sigma=LORA_CLIP_SIGMA,
-            use_shuffle=LORA_USE_SHUFFLE,
-        )
-
-        quant = quantizer.quantize(tensor)
-        result[name + '_data'] = quant['data'].numpy()
-        result[name + '_scale'] = quant['scale'].numpy()
-        if 'bias' in quant:
-            result[name + '_bias'] = quant['bias'].numpy()
-
-    total_bytes = sum(v.nbytes for v in result.values())
-    print(f"  Quantized LoRA ({LORA_QUANT_DTYPE}, group={LORA_QUANT_GROUP_SIZE}, sym={LORA_USE_SYM}, "
-          f"hadamard={LORA_USE_HADAMARD}, shuffle={LORA_USE_SHUFFLE}): {total_bytes / 1024 / 1024:.2f} MB")
-    return result
-
-
-def dequantize_lora_numpy(quant_dict):
-    """Dequantize a quantized LoRA dict back to float32 numpy arrays.
-
-    Args:
-        quant_dict: dict from quantize_lora_tensors (with _data/_scale/_bias keys)
-
-    Returns:
-        dict of {name: np.ndarray float32} with original 8 LoRA tensor names
-    """
-    if LORA_QUANT_DTYPE in ("F32", "F16"):
-        if LORA_QUANT_DTYPE == "F16":
-            return {k: v.astype(np.float32) for k, v in quant_dict.items()}
-        return quant_dict
-
-    is_q4 = LORA_QUANT_DTYPE in ("ROTARY_Q4", "ROTARY_Q4_CUDA")
-    is_rotary = LORA_QUANT_DTYPE in ("ROTARY_Q4", "ROTARY_Q4_CUDA", "ROTARY_Q8", "ROTARY_Q8_CUDA")
-    is_cuda = LORA_QUANT_DTYPE in ("Q8_CUDA", "ROTARY_Q8_CUDA", "ROTARY_Q4_CUDA")
-
-    result = {}
-    for name in LORA_INPUT_NAMES:
-        data = torch.from_numpy(quant_dict[name + '_data'])
-        scale = torch.from_numpy(quant_dict[name + '_scale'])
-        bias_arr = quant_dict.get(name + '_bias', None)
-        bias = torch.from_numpy(bias_arr) if bias_arr is not None else None
-
-        # Infer last_dim from scale shape and group structure
-        # scale shape: [..., num_groups] or [..., num_groups] for grouped
-        num_groups = scale.shape[-1]
-        last_dim = num_groups * LORA_QUANT_GROUP_SIZE
-
-        quantizer = LoRAQuantizer(
-            last_dim=last_dim,
-            group_size=LORA_QUANT_GROUP_SIZE,
-            is_q4=is_q4,
-            is_rotary=is_rotary,
-            is_cuda=is_cuda,
-            use_sym=LORA_USE_SYM,
-            use_hadamard=LORA_USE_HADAMARD,
-            use_clip=LORA_USE_CLIP,
-            clip_sigma=LORA_CLIP_SIGMA,
-            use_shuffle=LORA_USE_SHUFFLE,
-        )
-
-        quant_result = {'data': data, 'scale': scale}
-        if bias is not None:
-            quant_result['bias'] = bias
-
-        dequant = quantizer.dequantize(quant_result)
-        result[name] = dequant.numpy()
-
-    return result
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 # MODEL CLASSES
 # ══════════════════════════════════════════════════════════════════════════════
-
-def _parse_quant_dtype(dtype_str):
-    """Return (is_quantized, is_f16, is_q4, is_rotary, is_cuda) from a quant dtype string."""
-    quantized_set = ("Q8", "Q8_CUDA", "ROTARY_Q8", "ROTARY_Q8_CUDA", "ROTARY_Q4", "ROTARY_Q4_CUDA")
-    is_quantized = dtype_str in quantized_set
-    is_f16 = dtype_str == "F16"
-    is_q4 = dtype_str in ("ROTARY_Q4", "ROTARY_Q4_CUDA")
-    is_rotary = dtype_str in ("ROTARY_Q4", "ROTARY_Q4_CUDA", "ROTARY_Q8", "ROTARY_Q8_CUDA")
-    is_cuda = dtype_str in ("Q8_CUDA", "ROTARY_Q8_CUDA", "ROTARY_Q4_CUDA")
-    return is_quantized, is_f16, is_q4, is_rotary, is_cuda
-
-
-def _make_quantizer(dtype_str, last_dim):
-    """Create a LoRAQuantizer configured for the given dtype and last_dim."""
-    _, _, is_q4, is_rotary, is_cuda = _parse_quant_dtype(dtype_str)
-    return LoRAQuantizer(
-        last_dim=last_dim, group_size=LORA_QUANT_GROUP_SIZE,
-        is_q4=is_q4, is_rotary=is_rotary, is_cuda=is_cuda,
-        use_sym=LORA_USE_SYM, use_hadamard=LORA_USE_HADAMARD,
-        use_clip=LORA_USE_CLIP, clip_sigma=LORA_CLIP_SIGMA, use_shuffle=LORA_USE_SHUFFLE,
-    )
-
 
 class JINA_EMBED_LORA_FUSED(torch.nn.Module):
     """
     Combined token embedding + fused LoRA adapter in a single ONNX-exportable module.
 
-    Embedding quantization controlled by EMBED_QUANT_DTYPE.
-    LoRA quantization controlled by LORA_QUANT_DTYPE.
-    Each can be independently set to F32, F16, or any quantized mode.
+    Embedding stored in EMBED_DTYPE; LoRA tensors stored in LORA_DTYPE (each F16 or F32).
 
     Inputs:
         input_ids:  [batch, seq_len] int32 token IDs
@@ -851,97 +364,35 @@ class JINA_EMBED_LORA_FUSED(torch.nn.Module):
 
     def __init__(self, qwen_model, all_task_lora_list):
         super().__init__()
-        self.embed_is_quantized, self.embed_is_f16, _, _, _ = _parse_quant_dtype(EMBED_QUANT_DTYPE)
-        self.lora_is_quantized, self.lora_is_f16, _, _, _ = _parse_quant_dtype(LORA_QUANT_DTYPE)
+        self.embed_is_f16 = EMBED_DTYPE == "F16"
+        lora_torch_dtype = torch.float16 if LORA_DTYPE == "F16" else torch.float32
 
         # ── Embedding weights ────────────────────────────────────────────
         embed_weight = qwen_model.embed_tokens.weight.float()
-        if self.embed_is_quantized:
-            embed_last_dim = embed_weight.shape[-1]
-            self._embed_quantizer = _make_quantizer(EMBED_QUANT_DTYPE, embed_last_dim)
-            quant = self._embed_quantizer.quantize(embed_weight)
-            self.register_buffer('embed_data', quant['data'].contiguous())
-            self.register_buffer('embed_scale', quant['scale'].contiguous())
-            if 'bias' in quant:
-                self.register_buffer('embed_bias', quant['bias'].contiguous())
-        elif self.embed_is_f16:
+        if self.embed_is_f16:
             self.register_buffer('embed_weight', embed_weight.half().contiguous())
         else:
             self.embed_tokens = qwen_model.embed_tokens.float()
 
         # ── LoRA weights ─────────────────────────────────────────────────
-        if self.lora_is_quantized:
-            self._lora_quantizers = {}
-            for name in LORA_INPUT_NAMES:
-                fused = torch.from_numpy(
-                    np.stack([task_lora[name] for task_lora in all_task_lora_list], axis=0)
-                ).float()
-                last_dim = fused.shape[-1]
-                q = _make_quantizer(LORA_QUANT_DTYPE, last_dim)
-                self._lora_quantizers[name] = q
-                quant = q.quantize(fused)
-                self.register_buffer(name + '_data', quant['data'].contiguous())
-                self.register_buffer(name + '_scale', quant['scale'].contiguous())
-                if 'bias' in quant:
-                    self.register_buffer(name + '_bias', quant['bias'].contiguous())
-        elif self.lora_is_f16:
-            for name in LORA_INPUT_NAMES:
-                fused = torch.from_numpy(
-                    np.stack([task_lora[name] for task_lora in all_task_lora_list], axis=0)
-                ).half().contiguous()
-                self.register_buffer(name, fused)
-        else:
-            for name in LORA_INPUT_NAMES:
-                fused = torch.from_numpy(
-                    np.stack([task_lora[name] for task_lora in all_task_lora_list], axis=0)
-                ).float().contiguous()
-                self.register_buffer(name, fused)
-
-    def _dequant_embed(self, indices):
-        """Gather quantized embedding rows for needed tokens, then dequantize."""
-        quant_result = {'data': self.embed_data[indices], 'scale': self.embed_scale[indices]}
-        if hasattr(self, 'embed_bias'):
-            quant_result['bias'] = self.embed_bias[indices]
-        return self._embed_quantizer.dequantize(quant_result)
-
-    def _dequant_lora(self, name, task_index):
-        """Gather quantized LoRA data for the needed task, then dequantize."""
-        quantizer = self._lora_quantizers[name]
-        quant_result = {
-            'data': getattr(self, name + '_data')[task_index],
-            'scale': getattr(self, name + '_scale')[task_index],
-        }
-        if not LORA_USE_SYM:
-            bias = getattr(self, name + '_bias', None)
-            if bias is not None:
-                quant_result['bias'] = bias[task_index]
-        return quantizer.dequantize(quant_result).squeeze(0)
+        for name in LORA_INPUT_NAMES:
+            fused = torch.from_numpy(
+                np.stack([task_lora[name] for task_lora in all_task_lora_list], axis=0)
+            ).to(lora_torch_dtype).contiguous()
+            self.register_buffer(name, fused)
 
     def forward(self, input_ids, task_index):
         # ── Embedding lookup ─────────────────────────────────────────────
-        if self.embed_is_quantized:
-            hidden_states = self._dequant_embed(input_ids)
-        elif self.embed_is_f16:
+        if self.embed_is_f16:
             hidden_states = F.embedding(input_ids, self.embed_weight.float())
         else:
             hidden_states = self.embed_tokens(input_ids)
 
         # ── LoRA tensor selection ────────────────────────────────────────
-        if self.lora_is_quantized:
-            lora_outputs = tuple(
-                self._dequant_lora(name, task_index)
-                for name in LORA_INPUT_NAMES
-            )
-        elif self.lora_is_f16:
-            lora_outputs = tuple(
-                getattr(self, name)[task_index].squeeze(0).float()
-                for name in LORA_INPUT_NAMES
-            )
-        else:
-            lora_outputs = tuple(
-                getattr(self, name)[task_index].squeeze(0)
-                for name in LORA_INPUT_NAMES
-            )
+        lora_outputs = tuple(
+            getattr(self, name)[task_index].squeeze(0).float()
+            for name in LORA_INPUT_NAMES
+        )
 
         return (hidden_states,) + lora_outputs
 
@@ -949,34 +400,21 @@ class JINA_EMBED_LORA_FUSED(torch.nn.Module):
 class JINA_EMBED(torch.nn.Module):
     """Token embedding only (split mode). Outputs hidden_states in float32.
 
-    Quantization controlled by EMBED_QUANT_DTYPE independently from LORA_QUANT_DTYPE.
+    Embedding stored in EMBED_DTYPE (F16 or F32).
     """
 
     def __init__(self, qwen_model):
         super().__init__()
-        self.is_quantized, self.is_f16, _, _, _ = _parse_quant_dtype(EMBED_QUANT_DTYPE)
+        self.is_f16 = EMBED_DTYPE == "F16"
 
         embed_weight = qwen_model.embed_tokens.weight.float()
-        if self.is_quantized:
-            embed_last_dim = embed_weight.shape[-1]
-            self._embed_quantizer = _make_quantizer(EMBED_QUANT_DTYPE, embed_last_dim)
-            quant = self._embed_quantizer.quantize(embed_weight)
-            self.register_buffer('embed_data', quant['data'].contiguous())
-            self.register_buffer('embed_scale', quant['scale'].contiguous())
-            if 'bias' in quant:
-                self.register_buffer('embed_bias', quant['bias'].contiguous())
-        elif self.is_f16:
+        if self.is_f16:
             self.register_buffer('embed_weight', embed_weight.half().contiguous())
         else:
             self.embed_tokens = qwen_model.embed_tokens.float()
 
     def forward(self, input_ids):
-        if self.is_quantized:
-            quant_result = {'data': self.embed_data[input_ids], 'scale': self.embed_scale[input_ids]}
-            if hasattr(self, 'embed_bias'):
-                quant_result['bias'] = self.embed_bias[input_ids]
-            return self._embed_quantizer.dequantize(quant_result)
-        elif self.is_f16:
+        if self.is_f16:
             return F.embedding(input_ids, self.embed_weight.float())
         else:
             return self.embed_tokens(input_ids)
@@ -985,51 +423,18 @@ class JINA_EMBED(torch.nn.Module):
 class JINA_LORA_TASK(torch.nn.Module):
     """Single-task LoRA weight provider (split mode).
 
-    Stores the 8 stacked LoRA tensors for one task as constant buffers.
-    No inputs required — outputs are fixed for the task.
-
-    If LORA_QUANT_DTYPE is quantized (Q8/Q8_CUDA/ROTARY_Q8/ROTARY_Q8_CUDA/ROTARY_Q4/ROTARY_Q4_CUDA),
-    stores quantized data + scale (+ bias) and dequantizes on forward using the full
-    KV-style algorithm (rotary, hadamard, shuffle). If F16/F32, stores directly.
+    Stores the 8 stacked LoRA tensors for one task as constant buffers in
+    LORA_DTYPE (F16 or F32). No inputs required — outputs are fixed for the task.
     """
 
     def __init__(self, task_lora_dict):
         super().__init__()
-        self.is_quantized = LORA_QUANT_DTYPE in (
-            "Q8", "Q8_CUDA", "ROTARY_Q8", "ROTARY_Q8_CUDA", "ROTARY_Q4", "ROTARY_Q4_CUDA"
-        )
-
-        if self.is_quantized:
-            quant = quantize_lora_tensors(task_lora_dict)
-            for key, arr in quant.items():
-                self.register_buffer(key, torch.from_numpy(arr).contiguous())
-            # Pre-create quantizers (avoid torch.Generator in forward during ONNX trace)
-            self._quantizers = {}
-            for name in LORA_INPUT_NAMES:
-                last_dim = task_lora_dict[name].shape[-1]
-                self._quantizers[name] = _make_quantizer(LORA_QUANT_DTYPE, last_dim)
-        elif LORA_QUANT_DTYPE == "F16":
-            for name in LORA_INPUT_NAMES:
-                self.register_buffer(name, torch.from_numpy(task_lora_dict[name]).half().contiguous())
-        else:
-            for name in LORA_INPUT_NAMES:
-                self.register_buffer(name, torch.from_numpy(task_lora_dict[name]).float().contiguous())
+        lora_torch_dtype = torch.float16 if LORA_DTYPE == "F16" else torch.float32
+        for name in LORA_INPUT_NAMES:
+            self.register_buffer(name, torch.from_numpy(task_lora_dict[name]).to(lora_torch_dtype).contiguous())
 
     def forward(self):
-        if self.is_quantized:
-            outputs = []
-            for name in LORA_INPUT_NAMES:
-                data = getattr(self, name + '_data')
-                scale = getattr(self, name + '_scale')
-                bias = getattr(self, name + '_bias', None) if not LORA_USE_SYM else None
-                quant_result = {'data': data, 'scale': scale}
-                if bias is not None:
-                    quant_result['bias'] = bias
-                dequant = self._quantizers[name].dequantize(quant_result)
-                outputs.append(dequant)
-            return tuple(outputs)
-        else:
-            return tuple(getattr(self, name).float() for name in LORA_INPUT_NAMES)
+        return tuple(getattr(self, name).float() for name in LORA_INPUT_NAMES)
 
 
 class JINA_MAIN(torch.nn.Module):
@@ -1081,7 +486,10 @@ class JINA_MAIN(torch.nn.Module):
             qk_rms_norm_eps *= self.overflow_scale.square()
         self.register_buffer('hidden_rms_norm_eps', torch.tensor([hidden_rms_norm_eps], dtype=torch.float32))
         self.register_buffer('qk_rms_norm_eps', torch.tensor([qk_rms_norm_eps], dtype=torch.float32))
-        self.register_buffer('final_norm_weight', self.model.norm.weight.view(1, 1, -1) * (hidden_size ** 0.5))
+        # opt: store final_norm_weight as [1, H] (not [1,1,H]) so multiplying the pooled [batch, H]
+        # last-token row yields a rank-2 result that matches the runtime output buffer (the final
+        # RMSNorm's scalar is folded into the downstream L2 normalize, so only this weight survives).
+        self.register_buffer('final_norm_weight', self.model.norm.weight.view(1, -1) * (hidden_size ** 0.5))
 
         # ── Fuse base weights ────────────────────────────────────────────
         self._fuse_weights(hidden_size)
@@ -1237,12 +645,18 @@ class JINA_MAIN(torch.nn.Module):
             mlp_hidden = layer.mlp.act_fn(gate) * up
             hidden_states = residual + layer.mlp.down_proj(mlp_hidden) + self._apply_LoRA(mlp_hidden, down_a, down_b)
 
-        # ── Final RMSNorm ────────────────────────────────────────────────
-        last_hidden_state = self._rms_norm(hidden_states, self.hidden_rms_norm_eps) * self.final_norm_weight
+        # ── Final RMSNorm folded into the L2 normalize ───────────────────
+        # opt(skill scalar-absorbed-by-L2): the embedding is L2-normalized, so the final RMSNorm's
+        # rsqrt(sum(x^2)+eps) factor is a POSITIVE SCALAR that cancels exactly in F.normalize. Drop the
+        # sum-of-squares/rsqrt and keep ONLY the per-channel final_norm_weight (the direction-changing
+        # part), then L2 normalize — same math as the merged Omni pooling path. final_norm_weight is
+        # stored as [1, H] (see __init__) so multiplying the pooled [batch, H] row stays rank-2 (matches
+        # the runtime buffer). last_hidden_state is now weight-scaled but NOT RMS-divided; embeddings
+        # stay byte-equivalent and the demo's encode() default does not use it.
+        last_hidden_state = hidden_states[:, -1] * self.final_norm_weight
 
         # ── Last-token pooling + L2 normalize ────────────────────────────
-        pooled = last_hidden_state[:, -1, :]
-        embeddings = F.normalize(pooled, p=2, dim=-1)
+        embeddings = F.normalize(last_hidden_state, p=2, dim=-1)
 
         return embeddings, last_hidden_state
 
@@ -1276,8 +690,8 @@ if DO_EXPORT:
             print(f'  {k}: {v}')
         print(f'Adapter config: {expected_adapter_config}')
         print(f'\nFUSE_LORA_INTO_EMBED: {FUSE_LORA_INTO_EMBED}')
-        print(f'EMBED_QUANT_DTYPE: {EMBED_QUANT_DTYPE}')
-        print(f'LORA_QUANT_DTYPE: {LORA_QUANT_DTYPE}')
+        print(f'EMBED_DTYPE: {EMBED_DTYPE}')
+        print(f'LORA_DTYPE: {LORA_DTYPE}')
 
         if FUSE_LORA_INTO_EMBED:
             print(f'\nArchitecture: 1 fused Embed+LoRA + 1 shared Main ONNX (int32 task_index)')
@@ -1307,12 +721,11 @@ if DO_EXPORT:
 
         all_task_lora_list = [task_lora[name] for name in task_names]
 
-        # Validate quant settings against representative dims
-        representative_last_dim = list(task_lora[task_names[0]].values())[0].shape[-1]
-        for note in normalize_lora_quant_settings(representative_last_dim):
-            print(f"\n{note}")
-        if EMBED_QUANT_DTYPE not in SUPPORTED_LORA_QUANT_DTYPES:
-            raise ValueError(f"Unsupported EMBED_QUANT_DTYPE: {EMBED_QUANT_DTYPE}")
+        # Validate storage dtypes
+        if EMBED_DTYPE not in SUPPORTED_DTYPES:
+            raise ValueError(f"Unsupported EMBED_DTYPE: {EMBED_DTYPE}")
+        if LORA_DTYPE not in SUPPORTED_DTYPES:
+            raise ValueError(f"Unsupported LORA_DTYPE: {LORA_DTYPE}")
 
         # ══════════════════════════════════════════════════════════════════
         # Build Modules & Export
@@ -1322,11 +735,6 @@ if DO_EXPORT:
 
         if FUSE_LORA_INTO_EMBED:
             # ── Fused Mode: Embed + all-task LoRA in one ONNX ────────────
-            if EMBED_QUANT_DTYPE not in ("F32", "F16") or LORA_QUANT_DTYPE not in ("F32", "F16"):
-                print(f'\nApplying quantization (fused mode):')
-                print(f'  Embed: {EMBED_QUANT_DTYPE}  |  LoRA: {LORA_QUANT_DTYPE}')
-                print(f'  Weights stored quantized in ONNX; dequantized in forward pass.')
-
             model_EmbedLoRA = JINA_EMBED_LORA_FUSED(qwen_model, all_task_lora_list).eval()
 
             model_Main = JINA_MAIN(
@@ -1405,7 +813,7 @@ if DO_EXPORT:
             main_size = os.path.getsize(onnx_model_Main)
             total = embed_lora_size + main_size
             print(f'\n  {"=" * 56}')
-            print(f'  SIZE SUMMARY (Fused Mode, EMBED={EMBED_QUANT_DTYPE}, LORA={LORA_QUANT_DTYPE})')
+            print(f'  SIZE SUMMARY (Fused Mode, EMBED={EMBED_DTYPE}, LORA={LORA_DTYPE})')
             print(f'  {"=" * 56}')
             print(f'  Embed+LoRA:     {embed_lora_size / 1024 / 1024:>8.1f} MB  ({len(task_names)} tasks)')
             print(f'  Main:           {main_size / 1024 / 1024:>8.1f} MB')
@@ -1510,7 +918,7 @@ if DO_EXPORT:
             main_size = os.path.getsize(onnx_model_Main)
             total = embed_size + main_size
             print(f'\n  {"=" * 56}')
-            print(f'  SIZE SUMMARY (Split Mode, EMBED={EMBED_QUANT_DTYPE}, LORA={LORA_QUANT_DTYPE})')
+            print(f'  SIZE SUMMARY (Split Mode, EMBED={EMBED_DTYPE}, LORA={LORA_DTYPE})')
             print(f'  {"=" * 56}')
             print(f'  Embed:          {embed_size / 1024 / 1024:>8.1f} MB')
             for task_name in task_names:
@@ -1633,34 +1041,6 @@ packed_settings = {
     '_disabled_optimizers': disabled_optimizers,
 }
 
-# Separate session options for EmbedLoRA / LoRA models to prevent constant-folding
-# memory explosion. The dequantization ops (rotary, hadamard, shuffle, Q4 unpack) have
-# all-constant inputs, so ORT tries to evaluate them at session creation time,
-# materializing dozens of full-size intermediate float32 tensors simultaneously (60GB+).
-# NOTE: ORT_ENABLE_BASIC *still* includes constant folding. We must use ORT_DISABLE_ALL
-# and explicitly list ConstantFolding in disabled_optimizers to fully prevent it.
-session_opts_lora = onnxruntime.SessionOptions()
-session_opts_lora.log_severity_level        = 0 if ORT_LOG else 4
-session_opts_lora.log_verbosity_level       = 4
-session_opts_lora.inter_op_num_threads      = MAX_THREADS
-session_opts_lora.intra_op_num_threads      = MAX_THREADS
-session_opts_lora.execution_mode            = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
-session_opts_lora.graph_optimization_level  = onnxruntime.GraphOptimizationLevel.ORT_DISABLE_ALL
-for k, v in _session_configs.items():
-    session_opts_lora.add_session_config_entry(k, v)
-
-# Explicitly disable ConstantFolding (belt-and-suspenders with ORT_DISABLE_ALL)
-disabled_optimizers_lora = ['ConstantFolding', 'ConstantSharing']
-if disabled_optimizers:
-    disabled_optimizers_lora += disabled_optimizers
-
-packed_settings_lora = {
-    '_session_opts':        session_opts_lora,
-    '_providers':           ORT_Accelerate_Providers if ORT_Accelerate_Providers else ['CPUExecutionProvider'],
-    '_provider_options':    provider_options,
-    '_disabled_optimizers': disabled_optimizers_lora,
-}
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LOAD ONNX SESSIONS
@@ -1668,8 +1048,7 @@ packed_settings_lora = {
 
 if FUSE_LORA_INTO_EMBED:
     # --- Fused Mode: Embed + LoRA ---
-    # Use packed_settings_lora to avoid constant folding the dequant ops
-    ort_session_EmbedLoRA = create_session(onnx_model_EmbedLoRA, **packed_settings_lora)
+    ort_session_EmbedLoRA = create_session(onnx_model_EmbedLoRA, **packed_settings)
     in_name_EmbedLoRA     = get_in_names(ort_session_EmbedLoRA)
     out_name_EmbedLoRA    = get_out_names(ort_session_EmbedLoRA)
     binding_EmbedLoRA     = ort_session_EmbedLoRA.io_binding()
@@ -1677,8 +1056,7 @@ if FUSE_LORA_INTO_EMBED:
     print(f"\nUsable Providers: {ort_session_EmbedLoRA.get_providers()}")
 else:
     # --- Split Mode: Embed + per-task LoRA ---
-    # Embed also contains dequant ops for quantized embedding weights
-    ort_session_Embed = create_session(onnx_model_Embed, **packed_settings_lora)
+    ort_session_Embed = create_session(onnx_model_Embed, **packed_settings)
     in_name_Embed     = get_in_names(ort_session_Embed)
     out_name_Embed    = get_out_names(ort_session_Embed)
     binding_Embed     = ort_session_Embed.io_binding()
@@ -1689,7 +1067,7 @@ else:
     cached_lora_outputs = {}
     for task_name in task_names:
         lora_path = get_lora_onnx_path(task_name)
-        session = create_session(lora_path, **packed_settings_lora)
+        session = create_session(lora_path, **packed_settings)
         binding = session.io_binding()
         out_names = get_out_names(session)
         for name in out_names:
@@ -1757,7 +1135,7 @@ def encode(input_ids, task_name, return_last_hidden_state=False):
 
     # ── Output buffers ───────────────────────────────────────────────────
     embeddings_buf = get_cached_buffer('embeddings', (batch_size, hidden_size), np.float32)
-    last_hidden_state_buf = get_cached_buffer('last_hidden_state', (batch_size, seq_len, hidden_size), np.float32)
+    last_hidden_state_buf = get_cached_buffer('last_hidden_state', (batch_size, hidden_size), np.float32)
 
     if FUSE_LORA_INTO_EMBED:
         # ── Fused Mode: single EmbedLoRA session ─────────────────────────
